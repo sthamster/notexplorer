@@ -3,7 +3,7 @@
 # see https://www.gnu.org/licenses/ for license terms
 #
 # Nevoton Opentherm Explorer utility for Wirenboard
-# $Id: NOTExplorer.py 339 2023-03-19 11:03:48Z maxwolf $
+# $Id: NOTExplorer.py 349 2023-03-19 13:29:16Z maxwolf $
 # Copyright (C) 2023 MaxWolf 85530cf1e8ef7648e13e7ba2fce87337cbc904e757c83dde1b0d02ecb1508fb7
 #
 #
@@ -138,8 +138,8 @@ class OTDecoder:
         self.otd["000I:HB2"] = OTData("000", "R", "HB2", "BF", 0, 1, "", "Master status: Cooling enable")
         self.otd["000I:HB3"] = OTData("000", "R", "HB3", "BF", 0, 1, "", "Master status: OTC active")
         self.otd["000I:HB4"] = OTData("000", "R", "HB4", "BF", 0, 1, "", "Master status: CH2 enable")
-        self.otd["000I:HB5"] = OTData("000", "R", "HB5", "BF", 0, 1, "", "Master status: Summer/winter mode")
-        self.otd["000I:HB6"] = OTData("000", "R", "HB6", "BF", 0, 1, "", "Master status: DHW blocking")
+        self.otd["000I:HB5"] = OTData("000", "R", "HB5", "BF", 0, 1, "", "Master status: Summer mode")  # 0 - winter, 1 - summer
+        self.otd["000I:HB6"] = OTData("000", "R", "HB6", "BF", 0, 1, "", "Master status: DHW blocked")  # 0 - DHW unblocked, 1 - blocked
         self.otd["000I:HB7"] = OTData("000", "R", "HB7", "BF", 0, 1, "", "Master status: reserved")
         self.otd["000:HB0"]  = OTData("000", "R", "HB0", "BF", 0, 1, "", "Master status: CH enable")
         self.otd["000:HB1"]  = OTData("000", "R", "HB1", "BF", 0, 1, "", "Master status: DHW enable")
@@ -1638,7 +1638,7 @@ if __name__ == "__main__":
     verbose=args.verbose
 
     if verbose:
-        print("Nevoton OpenTherm Explorer utility for Wirenboard. Ver 0.%s beta (C) 2023 MaxWolf" % "$Revision: 339 $".split(' ')[1]);
+        print("Nevoton OpenTherm Explorer utility for Wirenboard. Ver 0.%s beta (C) 2023 MaxWolf" % "$Revision: 349 $".split(' ')[1]);
 
     h = []
     if args.logfileName != "":
