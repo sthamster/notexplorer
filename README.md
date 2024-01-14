@@ -36,7 +36,7 @@ NOTExplorer.py - утилита, позволяющая поэксперимен
 `./NOTExplorer.py -t wbe2-i-opentherm_11 -r read 3`
 
 Сброс блокировки котла через mqtt интерфейс (запись 1 в старший байт ячейки с DATA-ID 4)
-`./NOTExplorer.py -t wbe2-i-opentherm_11 -r -l log -d -v write 4 1%HB`
+`./NOTExplorer.py -t wbe2-i-opentherm_11 -r -l log -d -v write 4 1%HB0`
 
 Выдача устройству с идентификатором 11 через последовательный интерфейс `/dev/ttyMOD1` последовательности команд на: запись через opentherm в ячейку 2 (котла) значения 27, чтение ячейки 0 с одновременной передачей установленных битов 0 и 3 старшего байта данных (состояние "CH enable" + "OTC active"), запись температуры 50 градусов в ячейку 1, чтение ячеек 3 и 5  
 `./NOTExplorer.py -m /dev/ttyMOD1 -a 11 -r -l log w 2 27 r 0/1%HB0+1%HB3 w 1 50%F8.8 r 3 r 5`

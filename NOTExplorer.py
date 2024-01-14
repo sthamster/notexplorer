@@ -3,7 +3,7 @@
 # see https://www.gnu.org/licenses/ for license terms
 #
 # Nevoton Opentherm Explorer utility for Wirenboard
-# $Id: NOTExplorer.py 349 2023-03-19 13:29:16Z maxwolf $
+# $Id: NOTExplorer.py 392 2023-12-30 18:25:39Z maxwolf $
 # Copyright (C) 2023 MaxWolf 85530cf1e8ef7648e13e7ba2fce87337cbc904e757c83dde1b0d02ecb1508fb7
 #
 #
@@ -1638,7 +1638,7 @@ if __name__ == "__main__":
     verbose=args.verbose
 
     if verbose:
-        print("Nevoton OpenTherm Explorer utility for Wirenboard. Ver 0.%s beta (C) 2023 MaxWolf" % "$Revision: 349 $".split(' ')[1]);
+        print("Nevoton OpenTherm Explorer utility for Wirenboard. Ver 0.%s beta (C) 2023 MaxWolf" % "$Revision: 392 $".split(' ')[1]);
 
     h = []
     if args.logfileName != "":
