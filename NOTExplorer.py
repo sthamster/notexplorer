@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # see https://www.gnu.org/licenses/ for license terms
 #
-# Nevoton Opentherm Explorer utility for Wirenboard
-# $Id: NOTExplorer.py 392 2023-12-30 18:25:39Z maxwolf $
+# Nevoton OpenTherm module Explorer utility for Wirenboard
+# $Id: NOTExplorer.py 410 2024-02-01 22:29:56Z maxwolf $
 # Copyright (C) 2023 MaxWolf 85530cf1e8ef7648e13e7ba2fce87337cbc904e757c83dde1b0d02ecb1508fb7
 #
 #
@@ -18,10 +18,7 @@ import collections
 import logging
 import re
 from abc import ABC, abstractmethod, abstractproperty
-
-from pymodbus.client.sync import ModbusSerialClient as ModbusClient
-import paho.mqtt.client as mqtt
-
+import importlib
 
 #
 # Nevoton module (FW1.3) docs https://nevoton.ru/docs/instructions/OpenTherm_Modbus_BCG-1.0.2-W.pdf
@@ -77,11 +74,16 @@ DEV_PREF="/devices"
 NCTL_SUFFIX="/on"
 NCTL_ALL="/controls"
 # modbus holding reg 0xD1 aka 209
-NCTL_COMMAND="/controls/TR Command"
+NCTL_COMMAND_NEW="/controls/Command Type"
 # modbus holding reg 0xD2 aka 210
-NCTL_ID="/controls/TR ID"
+NCTL_ID_NEW="/controls/Command ID"
 # modbus holding reg 0xD3 aka 211
-NCTL_DATA="/controls/TR Data"
+NCTL_DATA_NEW="/controls/Data Type"
+#
+# old-style topics
+NCTL_COMMAND_OLD="/controls/TR Command"
+NCTL_ID_OLD="/controls/TR ID"
+NCTL_DATA_OLD="/controls/TR Data"
 
 # Nevoton's driver should reply over mqtt in specified number of seconds
 MQTT_ReplyTimeout=3
@@ -89,11 +91,6 @@ MQTT_ReplyTimeout=3
 MQTT_ResponseTimeout=60
 # Assume Opentherm slave device reponded with the same data (should be less than MQTT_ResponseTimeout)
 MQTT_PartResponseTimeout=30
-# Max retries on read
-MQTT_ReadRetries=5
-# Max retries on write
-MQTT_WriteRetries=5
-
 # Nevoton's module should provide opentherm slave device response in specified number of seconds
 Modbus_ResponseTimeout=20
 
@@ -255,7 +252,7 @@ class OTDecoder:
         self.otd["032"]      = OTData("032", "R", ""   , "F8.8", -40, 127, "°C", "Domestic hot water temperature 2")
         self.otd["033"]      = OTData("033", "R", ""   , "S16", -40, 500, "°C", "Boiler exhaust temperature")
         self.otd["034"]      = OTData("034", "R", ""   , "F8.8", -40, 127, "°C", "Boiler heat exchanger temperature") # unsure
-        self.otd["035"]      = OTData("035", "R", ""   , "U16"  , 0, 0, "", "Boiler fan speed setpoint") # unsure
+        self.otd["035"]      = OTData("035", "R", ""   , "U16"  , 0, 0, "", "Boiler fan speed") # rpm/60? unsure
 # could also be
 #        self.otd["035:HB"]      = OTData("035", "R", ""   , "U8"  , 0, 255, "", "Boiler fan speed Setpoint")
 #        self.otd["035:LB"]      = OTData("035", "R", ""   , "U8"  , 0, 255, "", "Boiler fan speed actual value")
@@ -401,6 +398,13 @@ class OTDecoder:
 # baxi ecofour unspecified regs
         self.otd["129"]      = OTData("129", "R", ""   , "U16", 0, 65535, "", "BAXI data-id 129")
         self.otd["130"]      = OTData("130", "R", ""   , "U16", 0, 65535, "", "BAXI data-id 130")
+        self.otd["131"]      = OTData("131", "R", ""   , "BF", 0, 0, "", "Remeha codes:")
+        self.otd["131:HB"]   = OTData("131", "R", "8-15", "U8", 0, 255, "", "dU")
+        self.otd["131:LB"]   = OTData("131", "R", "0-7", "U8", 0, 255, "", "dF")
+        self.otd["132"]      = OTData("132", "R", ""   , "BF", 0, 0, "", "Remeha Servicemessage:")
+        self.otd["132:HB"]   = OTData("132", "R", "8-15", "U8", 0, 255, "", "Next service type")
+        self.otd["132:LB"]   = OTData("132", "R", "0-7", "U8", 0, 255, "", "?")
+        self.otd["133"]      = OTData("133", "W", ""   , "U16", 0, 511, "", "Remeha detection connected SCU’s")
         self.otd["149"]      = OTData("149", "R", ""   , "U16", 0, 65535, "", "BAXI data-id 149")
         self.otd["150"]      = OTData("150", "R", ""   , "U16", 0, 65535, "", "BAXI data-id 150")
         self.otd["151"]      = OTData("151", "R", ""   , "U16", 0, 65535, "", "BAXI data-id 151")
@@ -626,7 +630,10 @@ class OTDecoder:
                 vn = v[0]
                 if v[1] == "F8.8": # float %8.8f
                     cv = v[0]
-                    nf = float(cv)
+                    if "~" == cv[0:1]:
+                        nf = -float(cv[1:])
+                    else: 
+                        nf = float(cv)
                     nf = nf * 256
                     n = int(nf)
                     return n & 0xffff
@@ -745,6 +752,14 @@ class OTMQTTInterfaсe(OpenthermInterface):
 
     def __init__(self, host, port, username, password, dev_id, verbose, ot_decoder):
 
+        self.client = None
+        try:
+            mqtt = importlib.import_module('paho.mqtt.client')
+        except Exception as e:
+            logging.error("Got paho.mqtt.client import_module exception: %s" % e)
+            print("Unable to load MQTT client connection module 'paho.mqtt.client'. Try to install it with 'apt-get install python3-paho-mqtt'")
+            raise e
+
         client_id = str(time.time()) + str(random.randint(0, 100000))
 
         self.client = mqtt.Client(client_id)
@@ -766,9 +781,12 @@ class OTMQTTInterfaсe(OpenthermInterface):
 
         self.mqtt_connected = False
         self.connected = False
-        self.tr_cmd = ""
-        self.tr_id = ""
-        self.tr_data = ""
+        self.nctl_command = ""
+        self.nctl_id = ""
+        self.nctl_data = ""
+        self.tr_cmd_reply = ""
+        self.tr_id_reply = ""
+        self.tr_data_reply = ""
         logging.debug("OTMQTTInterfaсe initialized")
 
     def get_device_id(self):
@@ -776,15 +794,15 @@ class OTMQTTInterfaсe(OpenthermInterface):
 
     def save_msgdata(self, r):
         replyStr = str(r.replyData.decode("utf-8"))
-        if NCTL_COMMAND in r.replyTopic:
-            self.tr_cmd = replyStr
-            logging.debug("Saving TR Command \'%s\'" % replyStr)
-        elif NCTL_ID in r.replyTopic:
-            self.tr_id = replyStr
-            logging.debug("Saving TR ID \'%s\'" % replyStr)
-        elif NCTL_DATA in r.replyTopic:
-            self.tr_data = replyStr
-            logging.debug("Saving TR Data \'%s\'" % replyStr)
+        if self.nctl_command in r.replyTopic:
+            self.tr_cmd_reply = replyStr
+            logging.debug("Saving Transparent Command \'%s\'" % replyStr)
+        elif self.nctl_id in r.replyTopic:
+            self.tr_id_reply = replyStr
+            logging.debug("Saving Transparent ID \'%s\'" % replyStr)
+        elif self.nctl_data in r.replyTopic:
+            self.tr_data_reply = replyStr
+            logging.debug("Saving Transparent Data \'%s\'" % replyStr)
         else:
             logging.warning("Got msg for unknown topic \'%s\' (%s)" % (r.replyTopic, replyStr))
 
@@ -859,20 +877,41 @@ class OTMQTTInterfaсe(OpenthermInterface):
 
         if self.mqtt_connected:
             logging.debug("mqtt connect notification received")
-            logging.debug("subscribing to " + self.dev_path + " TRansparent control topics")
-            self.client.subscribe(self.dev_path + NCTL_COMMAND)
-            self.client.subscribe(self.dev_path + NCTL_ID)
-            self.client.subscribe(self.dev_path + NCTL_DATA)
+            logging.debug("subscribing to new " + self.dev_path + " transparent control topics")
+            self.client.subscribe(self.dev_path + NCTL_COMMAND_NEW)
+            self.client.subscribe(self.dev_path + NCTL_ID_NEW)
+            self.client.subscribe(self.dev_path + NCTL_DATA_NEW)
             if self.clear_input(1, False) == 0:
-                logging.error("it seems that " + self.otdevice + " could not be controlled over mqtt, no respective transparent control topics exist")
-                return -7, "No mqtt controls for device \'%s\' found" % self.otdevice
-            logging.info("mqtt opentherm device \'%s\' found, transparent control topics subscribed" % self.otdevice)
+                logging.debug("no new NCTL topics exist");
+                self.client.unsubscribe(self.dev_path + NCTL_COMMAND_NEW)
+                self.client.unsubscribe(self.dev_path + NCTL_ID_NEW)
+                self.client.unsubscribe(self.dev_path + NCTL_DATA_NEW)
+
+                logging.debug("subscribing to old " + self.dev_path + " transparent control topics")
+                self.client.subscribe(self.dev_path + NCTL_COMMAND_OLD)
+                self.client.subscribe(self.dev_path + NCTL_ID_OLD)
+                self.client.subscribe(self.dev_path + NCTL_DATA_OLD)
+
+                if self.clear_input(1, False) == 0:
+                    logging.error("it seems that " + self.otdevice + " could not be controlled over mqtt, no respective transparent control topics exist")
+                    return -7, "No MQTT controls for device \'%s\' found" % self.otdevice
+                else:
+                    logging.info("mqtt opentherm device \'%s\' found, transparent control topics (old) subscribed" % self.otdevice)
+                    self.nctl_command = NCTL_COMMAND_OLD
+                    self.nctl_id = NCTL_ID_OLD
+                    self.nctl_data = NCTL_DATA_OLD
+            else:
+                logging.info("mqtt opentherm device \'%s\' found, transparent control topics (new) subscribed" % self.otdevice)
+                self.nctl_command = NCTL_COMMAND_NEW
+                self.nctl_id = NCTL_ID_NEW
+                self.nctl_data = NCTL_DATA_NEW
+
             if self.verbose:
-                print("Opentherm device \'%s\' found in mqtt" % self.otdevice)
+                print("Opentherm device \'%s\' found in MQTT" % self.otdevice)
             self.connected = True
             return 1, "Ok"
         else:
-            return -7, "Could not connect to mqtt"
+            return -7, "Could not connect to MQTT"
 
     def disconnect(self):
         if self.connected:
@@ -896,9 +935,9 @@ class OTMQTTInterfaсe(OpenthermInterface):
             return -100, "Not connected"
         self.clear_input(0, True)
         logging.info("sending cmd %d with dataid %d and param %d" % (cmd, cmdid, prm))
-        self.client.publish(self.dev_path + NCTL_COMMAND + NCTL_SUFFIX, str(cmd))
-        self.client.publish(self.dev_path + NCTL_ID + NCTL_SUFFIX, str(cmdid))
-        self.client.publish(self.dev_path + NCTL_DATA + NCTL_SUFFIX, str(prm))
+        self.client.publish(self.dev_path + self.nctl_command + NCTL_SUFFIX, str(cmd))
+        self.client.publish(self.dev_path + self.nctl_id + NCTL_SUFFIX, str(cmdid))
+        self.client.publish(self.dev_path + self.nctl_data + NCTL_SUFFIX, str(prm))
         ts = time.perf_counter()
         got_cmd_replies = 0
         got_data_replies = 0
@@ -912,7 +951,7 @@ class OTMQTTInterfaсe(OpenthermInterface):
                 logging.debug("got queued item (replies %d/%d): t=%s (%d secs passed), topic=%s, d=%s" % (got_cmd_replies, got_data_replies, time.strftime("%H:%M:%S", time.localtime(r.arrivalTime)), int(time.perf_counter() - ts), r.replyTopic, r.replyData ))
                 self.save_msgdata(r)
                 replyStr = str(r.replyData.decode("utf-8"))
-                if NCTL_COMMAND in r.replyTopic:
+                if self.nctl_command in r.replyTopic:
                     got_cmd_replies += 1
                     if got_cmd_replies == 1:
                         if replyStr == str(cmd):
@@ -956,13 +995,13 @@ class OTMQTTInterfaсe(OpenthermInterface):
                                 logging.error("got invalid opentherm response \'%s\' on cmd %d with dataid %d and prm %d" % (replyStr, cmd, cmdid, prm))
                                 logging.debug("response received in %d seconds after command" % int(time.perf_counter() - ts))
                                 return -2, "invalid opentherm response (%s)" % cmd_response
-                elif NCTL_ID in r.replyTopic:
+                elif self.nctl_id in r.replyTopic:
                     # actually does not arrive at all if "0" was sent to "TR ID/on"
                     if replyStr == str(cmdid):
                         logging.debug("got command id processing reply")
                     if replyStr == "0":
                         logging.debug("got command id confirmation reply")
-                elif NCTL_DATA in r.replyTopic:
+                elif self.nctl_data in r.replyTopic:
                     got_data_replies += 1
                     if got_data_replies == 1:
                         if replyStr == str(prm):
@@ -1019,18 +1058,18 @@ class OTMQTTInterfaсe(OpenthermInterface):
 
             except queue.Empty as err:
                 if time.perf_counter() - ts >= MQTT_PartResponseTimeout:
-                    if ((cmd == NCMD_READ and cmd_response == str(OT_READ_ACK)) or (cmd == NCMD_WRITE and cmd_response == str(OT_WRITE_ACK))) and (self.tr_id == str(cmdid)):
-                        logging.info("Treat saved data \'%s\' as received from opentherm slave" % self.tr_data)
+                    if ((cmd == NCMD_READ and cmd_response == str(OT_READ_ACK)) or (cmd == NCMD_WRITE and cmd_response == str(OT_WRITE_ACK))) and (self.tr_id_reply == str(cmdid)):
+                        logging.info("Treat saved data \'%s\' as received from opentherm slave" % self.tr_data_reply)
                         try:
                             cmd_response_n = int(cmd_response)
                         except:
                             logging.error("exception on conversion2 of cmd response \'%s\' to number" % cmd_response)
                             return -2, "non-numeric response cmd (%s)" % cmd_response
                         try:
-                            cmd_response_data_n = int(self.tr_data)
+                            cmd_response_data_n = int(self.tr_data_reply)
                         except:
-                            logging.error("exception on conversion2 of saved cmd response data \'%s\' to number" % self.tr_data)
-                            return -2, "non-numeric response data (%s)" % self.tr_data
+                            logging.error("exception on conversion2 of saved cmd response data \'%s\' to number" % self.tr_data_reply)
+                            return -2, "non-numeric response data (%s)" % self.tr_data_reply
                         logging.info("Returning successful response %d and data %d" % (cmd_response_n, cmd_response_data_n))
                         return 1, "ok", cmd_response_n, cmd_response_data_n
                         
@@ -1077,7 +1116,8 @@ class OTMQTTInterfaсe(OpenthermInterface):
         self.replyQ.put(Reply(time.time(), msg.topic, msg.payload))
 
     def __del__(self):
-        self.disconnect()
+        if self.client:
+            self.disconnect()
 
 
 ##############
@@ -1086,6 +1126,14 @@ class OTMQTTInterfaсe(OpenthermInterface):
 #
 class OTSerialInterfaсe(OpenthermInterface):
     def __init__(self, serial_device, modbus_id, verbose, ot_decoder):
+        self.client = None
+        self.modbus = None
+        try:
+            self.modbus = importlib.import_module('pymodbus.client.sync')
+        except Exception as e:
+            logging.error("Got pymodbus.client.sync import_module exception: %s" % e)
+            print("Unable to load Modbus client connection module 'pymodbus.client.sync'. Try to install it with 'apt-get install python3-pymodbus'")
+            raise e
         self.connected = False
         self.device = serial_device
         self.modbus_id = modbus_id
@@ -1101,24 +1149,29 @@ class OTSerialInterfaсe(OpenthermInterface):
 
     def connect(self):
         logging.debug("connecting serial device %s..." % (self.device))
-        self.client = ModbusClient(
-                    method='rtu',
-                    port=self.device,  # serial port device like "/dev/ttyMOD1"
-                    # It is believed that the following params could be nailed down due to the nature of Nevoton's device
-                    #    framer=ModbusRtuFramer,
-                        timeout=10,
-                        retries=3,
-                    #    retry_on_empty=False,
-                        close_comm_on_error=False,
-                    #    strict=True,
-                    # Serial setup parameters
-                        baudrate=19200,
-                        bytesize=8,
-                        parity="N",
-                        stopbits=1,
-                    #    handle_local_echo=False,
-                )
-        result = self.client.connect()
+        try:
+            self.client = self.modbus.ModbusSerialClient(
+                        method='rtu',
+                        port=self.device,  # serial port device like "/dev/ttyMOD1"
+                        # It is believed that the following params could be nailed down due to the nature of Nevoton's device
+                        #    framer=ModbusRtuFramer,
+                            timeout=10,
+                            retries=3,
+                        #    retry_on_empty=False,
+                            close_comm_on_error=False,
+                        #    strict=True,
+                        # Serial setup parameters
+                            baudrate=19200,
+                            bytesize=8,
+                            parity="N",
+                            stopbits=1,
+                        #    handle_local_echo=False,
+                    )
+            result = self.client.connect()
+        except Exception as e:
+            logging.error("Got ModbusSerialClient exception: %s" % e)
+            return -7, "Got exception connecting serial device \'%s\': %s" % (self.device, e)
+
         logging.debug("connect returned %s with %s" % (type(result).__name__, str(result)))
         if result != True:
             return -7, "Could not connect serial device \'%s\'" % (self.device)
@@ -1210,7 +1263,8 @@ class OTSerialInterfaсe(OpenthermInterface):
 
 
     def __del__(self):
-        self.disconnect()
+        if self.modbus and self.client:
+            self.disconnect()
 
 
 ##############
@@ -1218,10 +1272,11 @@ class OTSerialInterfaсe(OpenthermInterface):
 # Main opentherm control logic
 #
 class OTControl:
-    def __init__(self, ot_interface, ot_decoder, verbose=False):
+    def __init__(self, ot_interface, ot_decoder, verbose=False, retries=1):
         self.cmd_processor = ot_interface
         self.otdecoder = ot_decoder
         self.verbose = verbose
+        self.retries = retries
 
         # specific data-values for particular data-id read operations (to be updated later)
         self.specPrm = { "000": "65280" }
@@ -1231,7 +1286,7 @@ class OTControl:
     def connect(self):
         return self.cmd_processor.connect()
 
-    def read(self, dataid, retry = False):
+    def read(self, dataid, ignoreAllErrors = False):
         if "/" in dataid:
             inval = dataid.split('/')
             dataid = inval[0]
@@ -1256,7 +1311,7 @@ class OTControl:
 
         if self.verbose:
             print("Reading dataid %d%s..." % (dataid_n, ("/" + str(prm_n)) if prm_n != 0 else ""))
-        retries = MQTT_ReadRetries if retry else 1
+        retries = self.retries
         rn = 1
         while rn <= retries:
             if rn != 1:
@@ -1265,6 +1320,8 @@ class OTControl:
             r = self.cmd_processor.send_cmd_verbose(NCMD_READ, dataid_n, prm_n)
             if r[0] < 0:
                 eprint("Read of dataid %d/%d failed: %s" %(dataid_n, prm_n, r[1]))
+                if ignoreAllErrors:
+                    continue;
                 if r[0] == -1 and (r[2] == OT_UNKNOWN_DATA_ID or r[2] == OT_DATA_INVALID):
                     return -r[2], "Opentherm error " + self.otdecoder.msg_descr(r[2])
                 elif r[0] < -5:
@@ -1286,7 +1343,7 @@ class OTControl:
         return -2, "Reading error"
 
 
-    def write(self, dataid, prm, retry = False):
+    def write(self, dataid, prm):
         try:
             dataid_n = int(dataid)
         except:
@@ -1299,7 +1356,7 @@ class OTControl:
             return -1, "Invalid prm value (%s)" % prm
         if self.verbose:
             print("Writing dataid %d with value %d..." % (dataid_n, prm_n))
-        retries = MQTT_WriteRetries if retry else 1
+        retries = self.retries
         rn = 1
         while rn <= retries:
             if rn != 1:
@@ -1326,7 +1383,7 @@ class OTControl:
         return -2, "Writing error"
 
 
-    def read_err(self, erridx, retry = False):
+    def read_err(self, erridx):
         try:
             erridx_n = int(erridx)
         except:
@@ -1348,7 +1405,7 @@ class OTControl:
                 if self.verbose:
                     print("Reading %d FHBs..." % fhbn)
                 for fi in range(0, fhbn - 1, 1):
-                    self.read_err(str(fi), retry)
+                    self.read_err(str(fi))
                 return 1, "Ok"
         else:
            erridx_n = erridx_n & 0xff
@@ -1356,7 +1413,7 @@ class OTControl:
         if self.verbose:
             print("Reading Fault History Buffer (FHB) entry %d..." % erridx_n)
         prm = (erridx_n << 8)
-        retries = MQTT_ReadRetries if retry else 1
+        retries = self.retries
         rn = 1
         while rn <= retries:
             if rn != 1:
@@ -1383,7 +1440,7 @@ class OTControl:
         return -2, "FHB Reading error"
 
 
-    def read_tsp(self, tspid, retry = False):
+    def read_tsp(self, tspid):
         if len(tspid) == 0:
             tspid = "0"
         if "-" in tspid:
@@ -1422,7 +1479,7 @@ class OTControl:
                 tspn = ((r[3] >> 8) & 0xff)
                 if self.verbose:
                     print("There are %d TSP registers reported by boiler..." % tspn)
-                return self.read_tsp(str(tspid_n) + "-" + str(tspn - 1), retry)
+                return self.read_tsp(str(tspid_n) + "-" + str(tspn - 1))
 
         if (tspid_n >= 0) and (last_tspid_n > 0) and (tspid_n != last_tspid_n): # explicit range of TSPs
             tspid_n = tspid_n & 0xff
@@ -1430,7 +1487,7 @@ class OTControl:
             if self.verbose:
                 print("Reading TSPs from %d to %d..." % (tspid_n, last_tspid_n))
             for ti in range(tspid_n, last_tspid_n + 1, 1):
-                r = self.read_tsp(str(ti), retry)
+                r = self.read_tsp(str(ti))
                 if r[0] < -5:
                     return r[0], r[1]
             return 1, "Ok"
@@ -1438,7 +1495,7 @@ class OTControl:
         if self.verbose:
             print("Reading Transparent Slave Parameter (TSP) %d..." % tspid_n)
         prm = (tspid_n << 8)
-        retries = MQTT_ReadRetries if retry else 1
+        retries = self.retries
         rn = 1
         while rn <= retries:
             if rn != 1:
@@ -1465,7 +1522,7 @@ class OTControl:
         return -2, "TSP Reading error"
 
 
-    def write_tsp(self, tspid, tspdata, retry = False):
+    def write_tsp(self, tspid, tspdata):
         try:
             tspid_n = int(tspid) & 0xff
         except:
@@ -1479,7 +1536,7 @@ class OTControl:
         if self.verbose:
             print("Writing Transparent Slave Parameter (TSP) %d with %d..." % (tspid_n, tspdata_n))
         prm = (tspid_n << 8) | tspdata_n
-        retries = MQTT_WriteRetries if retry else 1
+        retries = self.retries
         rn = 1
         while rn <= retries:
             if rn != 1:
@@ -1505,7 +1562,7 @@ class OTControl:
                 return 1, "Ok"
         return -2, "TSP Writing error"
 
-    def scan(self, retry):
+    def scan(self):
         print("Scanning all known readable data-id of \'" + self.cmd_processor.get_device_id() + "\' device")
         skipId11 = False
         for di in self.otdecoder.otd:
@@ -1513,17 +1570,17 @@ class OTControl:
                 if int(di) == 11 and skipId11:
                     logging.debug("skipping reg 11 as far as read_tsp was done");
                     continue
-                r = self.read(di, retry)
+                r = self.read(di, True)
                 if (int(di) == 10) and (r[0] == 1): 
                     logging.debug("Apparently TSP regs could be read" )
                     skipId11 = True
-                    self.read_tsp("-1", retry)
+                    self.read_tsp("-1")
                 elif r[0] < -5:
                     return r[0], r[1]
         return 1, "Ok"
 
 
-    def full_scan(self, id_range, retry):
+    def full_scan(self, id_range):
         if len(id_range) == 0:
             id_range = "0-255"
         if "-" in id_range:
@@ -1544,9 +1601,9 @@ class OTControl:
             logging.error("exception on conversion of finish_id \'" + finish_id + "\' to number")
             return -1, "Non-numeric finish_id (%s)" % finish_id
 
-        print("Full scanning  of \'" + self.cmd_processor.get_device_id() + "\' device in range " + str(start_id_n) + ".." + str(finish_id_n))
+        print("Full scanning  of \'" + self.cmd_processor.get_device_id() + "\' device for data-id in range " + str(start_id_n) + ".." + str(finish_id_n))
         for di in range(start_id_n, finish_id_n + 1, 1):
-            r = self.read(str(di), retry)
+            r = self.read(str(di), True)
             if r[0] < -5:
                 return r[0], r[1]
         return 1, "Ok"
@@ -1613,20 +1670,21 @@ class OTControl:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Opentherm control via mqtt", add_help=False)
-    parser.add_argument("-t", "--topic", dest="mqtt_device", type=str, help="Nevoton module id as mqtt topic", default="") # wbe2-i-opentherm_11
+    parser = argparse.ArgumentParser(description="Nevoton opentherm module control via MQTT (with option -t) or Serial/ModBus (with option -m) interface", add_help=False)
+    parser.add_argument("-t", "--topic", dest="mqtt_device", type=str, help="Nevoton module id as MQTT topic", default="") # wbe2-i-opentherm_11
     parser.add_argument("-h", "--host", dest="host", type=str, help="MQTT host", default="localhost")
     parser.add_argument("-p", "--port", dest="port", type=int, help="MQTT port", default="1883")
-    parser.add_argument("-u", "--username", dest="username", type=str, help="MQTT username", default="")
+    parser.add_argument("-U", "--username", dest="username", type=str, help="MQTT username", default="")
     parser.add_argument("-P", "--password", dest="password", type=str, help="MQTT password", default="")
     parser.add_argument("-m", "--modbusRTU", dest="modbus_device", type=str, help="Modbus/serial device to access Nevoton's module", default="") # /dev/ttyMOD1
-    parser.add_argument("-a", "--address", dest="addr", type=int, help="ModbusId", default="11")
-    parser.add_argument("-r", "--retry", dest="retry", action="store_true", help="Retry request on non-fatal errors")
+    parser.add_argument("-a", "--address", dest="addr", type=int, help="Modbus Id", default="11")
+    parser.add_argument("-r", "--retry", dest="retries", type=int, help="Number of retries on non-fatal errors", nargs='?', default=1, const=3)
     parser.add_argument("-l", "--logfile", dest="logfileName", type=str, help="Log file name", default="notexpl.log")
-    parser.add_argument("-c", "--console", dest="conlog", action="store_true", help="Logging to console")
-    parser.add_argument("-s", "--syslog", dest="syslog", action="store_true", help="Logging to syslog")
-    parser.add_argument("-v", "--verbose", dest="verbose", action="store_true", help="Verbose output")
-    parser.add_argument("-d", "--debug", dest="debug", action="store_true", help="Debug logging")
+    parser.add_argument("-c", "--console", dest="conlog", action="store_true", help="Enable logging to console")
+    parser.add_argument("-s", "--syslog", dest="syslog", action="store_true", help="Enable logging to syslog")
+    parser.add_argument("-v", "--verbose", dest="verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("-d", "--debug", dest="debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("-?", "--help", dest="help", action="store_true", help="This help")
     parser.add_argument(
         "cmd",
         type=str,
@@ -1635,10 +1693,17 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if len(sys.argv) < 2 or args.help:
+    	parser.print_help()
+    	sys.exit(0)
+
     verbose=args.verbose
+    if args.retries <= 0:
+        args.retries = 1
 
     if verbose:
-        print("Nevoton OpenTherm Explorer utility for Wirenboard. Ver 0.%s beta (C) 2023 MaxWolf" % "$Revision: 392 $".split(' ')[1]);
+        print("Nevoton OpenTherm Explorer utility for Wirenboard. Ver 0.%s beta (C) 2024 MaxWolf" % "$Revision: 410 $".split(' ')[1]);
 
     h = []
     if args.logfileName != "":
@@ -1651,22 +1716,28 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format='%(asctime)s %(levelname)s %(message)s', handlers = h)
 
     logging.info('===== Starting NOTExplorer')
+    logging.debug('there will be %d retries on each exchange' % args.retries);
     try:
         ot_decoder = OTDecoder()
 
-        if args.mqtt_device != "":
-            ot_interface = OTMQTTInterfaсe(args.host, args.port, args.username, args.password, args.mqtt_device, verbose, ot_decoder)
-        elif args.modbus_device != "":
-            ot_interface = OTSerialInterfaсe(args.modbus_device, args.addr, verbose, ot_decoder)
-            if args.debug:
-                log = logging.getLogger('pymodbus')
-                log.setLevel(logging.INFO) # use logging.DEBUG to reveal intimate modbus exchanges
-        else:
-            eprint("Either -t or -m option should be specified")
-            logging.error("Neither mqtt nor serial device specified")
+        try:
+            if args.mqtt_device != "":
+                ot_interface = OTMQTTInterfaсe(args.host, args.port, args.username, args.password, args.mqtt_device, verbose, ot_decoder)
+            elif args.modbus_device != "":
+                ot_interface = OTSerialInterfaсe(args.modbus_device, args.addr, verbose, ot_decoder)
+                if args.debug:
+                    log = logging.getLogger('pymodbus')
+                    log.setLevel(logging.INFO) # use logging.DEBUG to reveal intimate modbus exchanges
+            else:
+                eprint("Either -t or -m (or --help) option should be specified")
+                logging.error("Neither MQTT nor Serial device specified")
+                sys.exit(1)
+        except Exception as e:
+            ot_interface = None
+            print("Error creating opentherm communitcation")
             sys.exit(1)
 
-        otc = OTControl(ot_interface, ot_decoder, verbose)
+        otc = OTControl(ot_interface, ot_decoder, verbose, args.retries)
 
         logging.info("Started with command: [%s/%s/%s]" % (
             args.cmd[0] if len(args.cmd) >= 1 else "", 
@@ -1681,9 +1752,9 @@ if __name__ == "__main__":
 
         result = (-1, "UNDEF")
         if args.cmd[0] == "scan" or args.cmd[0] == "s":
-            result = otc.scan(args.retry)
+            result = otc.scan()
         elif args.cmd[0] == "fullscan" or args.cmd[0] == "f":
-            result = otc.full_scan(args.cmd[1] if len(args.cmd) > 1 and args.cmd[1][0].isdigit() else "", args.retry)
+            result = otc.full_scan(args.cmd[1] if len(args.cmd) > 1 and args.cmd[1][0].isdigit() else "")
         elif args.cmd[0] == "cmd" or args.cmd[0] == "c":
             result = otc.interactive_cmd()
         else:
@@ -1694,7 +1765,7 @@ if __name__ == "__main__":
                     if argI + 1 >= argN:
                         result = ( -1, "No dataid to read" )
                     else:
-                        result = otc.read(args.cmd[argI+1], args.retry)
+                        result = otc.read(args.cmd[argI+1])
                     argI = argI + 2
                 elif args.cmd[argI] == "write" or args.cmd[argI] == "w":
                     if argI + 1 >= argN:
@@ -1703,13 +1774,13 @@ if __name__ == "__main__":
                         if argI + 2 >= argN:
                             result = ( -1, "No dataid to write" )
                         else:
-                            result = otc.write(args.cmd[argI+1], args.cmd[argI+2], args.retry)
+                            result = otc.write(args.cmd[argI+1], args.cmd[argI+2])
                     argI = argI + 3
                 elif args.cmd[argI] == "readtsp" or args.cmd[argI] == "rt":
                     if argI + 1 >= argN:
                         result = ( -1, "No tspid to read" )
                     else:
-                        result = otc.read_tsp(args.cmd[argI+1], args.retry)
+                        result = otc.read_tsp(args.cmd[argI+1])
                     argI = argI + 2
                 elif args.cmd[argI] == "writetsp" or args.cmd[argI] == "wt":
                     if argI + 1 >= argN:
@@ -1718,13 +1789,13 @@ if __name__ == "__main__":
                         if argI + 2 >= argN:
                             result = ( -1, "No tsp data to write" )
                         else:
-                            result = otc.write_tsp(args.cmd[argI+1], args.cmd[argI+2], args.retry)
+                            result = otc.write_tsp(args.cmd[argI+1], args.cmd[argI+2])
                     argI = argI + 3
                 elif args.cmd[argI] == "readerr" or args.cmd[argI] == "re":
                     if argI + 1 >= argN:
                         result = ( -1, "No error idx to read" )
                     else:
-                        result = otc.read_err(args.cmd[argI+1], args.retry)
+                        result = otc.read_err(args.cmd[argI+1])
                     argI = argI + 2
                 else:
                     result = (-1, "Unknown command \'" + args.cmd[argI] + "\'")
